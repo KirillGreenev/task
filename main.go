@@ -44,9 +44,11 @@ func initDB() (*sqlx.DB, error) {
 func (repo *SQLiteCityRepository) Create(ctx context.Context, city City) (int, error) {
 	result, err := repo.db.ExecContext(ctx, "INSERT INTO cities (name, state) VALUES (?, ?)",
 		city.Name, city.State)
+
 	if err != nil {
 		return 0, err
 	}
+
 	id, err := result.LastInsertId()
 	return int(id), err
 }
