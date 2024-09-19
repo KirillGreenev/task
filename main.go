@@ -1,38 +1,67 @@
+// Написать мини сервис с разделением слоев в одном main.go файле. Сервис должен уметь:
+// 1. Подключаться к базе данных
+// 2. Использовать кэш c применением Proxy паттерна
+// 3. Принимать http запросы REST like API
+// 4. Регистрировать пользователя в базе данных
+// 5. Выводить список всех пользователей
+// 6. У пользователя следующие данные email, password, name, age
+// 7. Запретить регистрацию пользователей с одинаковым email и возрастом меньше 18 лет
+// Context, log
+
 package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
+	"github.com/go-chi/chi"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
 )
 
-type City struct {
-	ID    int    `db:"id"`
-	Name  string `db:"name"`
-	State string `db:"state"`
+// models
+type User struct {
+	ID       int    `json:"id" db:"id"`
+	Email    string `json:"email" db:"email"`
+	Password string `json:"password" db:"password"`
+	Name     string `json:"name" db:"name"`
+	Age      int    `json:"age" db:"age"`
 }
 
-type SQLiteCityRepository struct {
+// repository
+type UserRepository interface {
+	Create(ctx context.Context, user *User) error
+	GetAll(ctx context.Context) ([]User, error)
+}
+
+type UserRepositoryImpl struct {
 	db *sqlx.DB
 }
 
-func NewSQLiteCityRepository(db *sqlx.DB) *SQLiteCityRepository {
-	return &SQLiteCityRepository{db: db}
+func NewUserRepositoryImpl(db *sqlx.DB) *UserRepositoryImpl {
+	return &UserRepositoryImpl{db: db}
 }
 
 func initDB() (*sqlx.DB, error) {
-	db, err := sqlx.Open("sqlite3", "./test.db")
+	db, err := sqlx.Open("sqlite3", "./users.db")
 	if err != nil {
 		return nil, err
 	}
 
-	createTableSQL := `CREATE TABLE IF NOT EXISTS cities (
-        id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-        name VARCHAR(30) NOT NULL,
-        state VARCHAR(30) NOT NULL
-    );`
+	createTableSQL := `CREATE TABLE IF NOT EXISTS users (
+                                     id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                                     email VARCHAR(100) NOT NULL UNIQUE,
+                                     name VARCHAR(100) NOT NULL,
+                                     age INTEGER,
+                                     password VARCHAR(100) NOT NULL
+);`
 
 	if _, err := db.Exec(createTableSQL); err != nil {
 		return nil, err
@@ -41,33 +70,124 @@ func initDB() (*sqlx.DB, error) {
 	return db, nil
 }
 
-func (repo *SQLiteCityRepository) Create(ctx context.Context, city City) (int, error) {
-	result, err := repo.db.ExecContext(ctx, "INSERT INTO cities (name, state) VALUES (?, ?)",
-		city.Name, city.State)
+func (repo *UserRepositoryImpl) Create(ctx context.Context, user *User) error {
+	_, err := repo.db.ExecContext(ctx, "INSERT INTO users (email, password, name, age) VALUES (?, ?, ?, ?)",
+		user.Email, user.Password, user.Name, user.Age)
+	return err
+}
 
-	if err != nil {
-		return 0, err
+func (repo *UserRepositoryImpl) GetAll(ctx context.Context) ([]User, error) {
+	var users []User
+	err := repo.db.SelectContext(ctx, &users, "SELECT * FROM users")
+	return users, err
+}
+
+type CacheProxy struct {
+	repo        UserRepository
+	cache       map[int]User
+	countUserDb int
+}
+
+func NewCacheProxy(repo UserRepository) *CacheProxy {
+	return &CacheProxy{
+		repo:        repo,
+		cache:       make(map[int]User),
+		countUserDb: -100,
+	}
+}
+
+func (cp *CacheProxy) Create(ctx context.Context, user *User) error {
+	cp.countUserDb++
+	return cp.repo.Create(ctx, user)
+
+}
+func (cp *CacheProxy) GetAll(ctx context.Context) ([]User, error) {
+	if len(cp.cache) == cp.countUserDb {
+		users := make([]User, 0, len(cp.cache))
+		for _, user := range cp.cache {
+			users = append(users, user)
+		}
+		return users, nil
 	}
 
-	id, err := result.LastInsertId()
-	return int(id), err
+	users, err := cp.repo.GetAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	cp.countUserDb = len(users)
+	for _, user := range users {
+		cp.cache[user.ID] = user
+	}
+
+	return users, nil
 }
 
-func (repo *SQLiteCityRepository) Delete(ctx context.Context, id int) error {
-	_, err := repo.db.ExecContext(ctx, "DELETE FROM cities WHERE id = ?", id)
-	return err
+// Service
+type UserService interface {
+	Create(ctx context.Context, user *User) error
+	GetAll(ctx context.Context) ([]User, error)
 }
 
-func (repo *SQLiteCityRepository) Update(ctx context.Context, city City) error {
-	_, err := repo.db.ExecContext(ctx, "UPDATE cities SET name = ?, state = ? WHERE id = ?",
-		city.Name, city.State, city.ID)
-	return err
+type UserServiceImpl struct {
+	repo UserRepository
 }
 
-func (repo *SQLiteCityRepository) List(ctx context.Context) ([]City, error) {
-	var cities []City
-	err := repo.db.SelectContext(ctx, &cities, "SELECT * FROM cities")
-	return cities, err
+func (u *UserServiceImpl) Create(ctx context.Context, user *User) error {
+	if user.Age < 18 {
+		return fmt.Errorf("Age under 18, registration prohibited")
+	}
+	return u.repo.Create(ctx, user)
+}
+
+func (u *UserServiceImpl) GetAll(ctx context.Context) ([]User, error) {
+	return u.repo.GetAll(ctx)
+}
+
+func NewUserServiceImpl(repo UserRepository) *UserServiceImpl {
+	return &UserServiceImpl{repo: repo}
+}
+
+// Controller
+type ControllerUser struct {
+	UserService UserService
+}
+
+func NewControllerUser(userService UserService) *ControllerUser {
+	return &ControllerUser{UserService: userService}
+}
+
+func (c *ControllerUser) RegisterHandler(w http.ResponseWriter, r *http.Request) {
+	var user User
+	if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	reqCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	if err := c.UserService.Create(reqCtx, &user); err != nil {
+		log.Println("ControllerUser.RegisterHandler error: ", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	fmt.Fprint(w, "User successfully registered")
+}
+
+func (c *ControllerUser) GetUsersHandler(w http.ResponseWriter, r *http.Request) {
+	reqCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	user, err := c.UserService.GetAll(reqCtx)
+	if err != nil {
+		log.Println("ControllerUser.GetUsersHandler error: ", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(user)
 }
 
 func main() {
@@ -77,47 +197,40 @@ func main() {
 	}
 	defer db.Close()
 
-	repo := NewSQLiteCityRepository(db)
-
 	ctx := context.Background()
 
-	city := City{Name: "Москва", State: "РФ"}
-	id, err := repo.Create(ctx, city)
-	if err != nil {
-		log.Fatal(err)
+	controller := NewControllerUser(NewUserServiceImpl(NewCacheProxy(NewUserRepositoryImpl(db))))
+
+	r := chi.NewRouter()
+
+	r.Post("/user", controller.RegisterHandler)
+	r.Get("/user", controller.GetUsersHandler)
+
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      r,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
-	log.Printf("Добавлен город с id: %d\n", id)
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-	cities, err := repo.List(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("Список городов:", cities)
+	go func() {
+		log.Println("Starting server on :8080...")
+		if err = server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
 
-	city.ID = id
-	city.Name = "Санкт-Петербург"
-	err = repo.Update(ctx, city)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("Обновлён город:", city)
+	<-stop
 
-	err = repo.Delete(ctx, id)
-	if err != nil {
-		log.Fatal(err)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	if err = server.Shutdown(ctx); err != nil {
+		log.Fatalf("Server shutdown error: %v", err)
 	}
-	log.Println("Удалён город с ID:", id)
+
+	log.Println("Server stopped gracefully")
 }
-
-/* Написать репозиторий к базе данных test на mysql, используя библиотеку sqlx.CREATE TABLE cities (
-id INTEGER NOT NULL PRIMARY KEY,
-name VARCHAR(30) NOT NULL,
-state VARCHAR(30) NOT NULL
-);
-Реализовать следующие методы:
-Create
-Delete
-Update
-List
-*/
